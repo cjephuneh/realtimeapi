@@ -12,6 +12,7 @@ export default function Home() {
   const wsRef = useRef<WebSocket | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<BlobPart[]>([]);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
   
   // Connect to our WebSocket proxy instead of directly to Azure
   useEffect(() => {
@@ -24,11 +25,19 @@ export default function Home() {
         const wsUrl = `${protocol}//${window.location.host}/api/ws-proxy`;
         console.log("Connecting to WebSocket proxy:", wsUrl);
         
+        // Close any existing connection
+        if (wsRef.current) {
+          try {
+            wsRef.current.close();
+          } catch (e) {
+            console.error("Error closing existing WebSocket:", e);
+          }
+        }
+        
         const ws = new WebSocket(wsUrl);
         
         ws.onopen = () => {
           console.log("WebSocket connection to proxy opened");
-          // Don't set connected here - wait for the status message from the proxy
           setStatus("Connected to proxy, waiting for Azure...");
         };
         
@@ -45,19 +54,63 @@ export default function Home() {
                 setIsConnected(false);
                 setStatus(`Disconnected (${data.code}: ${data.reason || 'Unknown reason'})`);
               }
-            } else if (data.type === "message") {
-              setMessages(prev => [...prev, { 
-                role: "assistant", 
-                content: data.content || "Sorry, I couldn't process that."
-              }]);
+            } else if (data.type === "response" || data.type === "response.partial") {
+              // Handle response from real-time API
+              if (data.data && data.data.content && data.data.content.length > 0) {
+                const content = data.data.content[0];
+                if (content.text) {
+                  setMessages(prev => [...prev, { 
+                    role: "assistant", 
+                    content: content.text
+                  }]);
+                }
+              }
+            } else if (data.type === "speech.partial" || data.type === "speech") {
+              // Handle speech response
+              console.log("Received speech/audio response from Azure");
+              
+              if (data.data && data.data.audio) {
+                try {
+                  // Create audio element if it doesn't exist
+                  if (!audioRef.current) {
+                    audioRef.current = new Audio();
+                  }
+                  
+                  // Convert base64 audio to a blob
+                  const audioBlob = base64ToBlob(data.data.audio, 'audio/mp3');
+                  const audioUrl = URL.createObjectURL(audioBlob);
+                  
+                  // Play the audio
+                  audioRef.current.src = audioUrl;
+                  audioRef.current.play().catch(err => {
+                    console.error("Error playing audio:", err);
+                  });
+                  
+                  // Clean up the blob URL when done
+                  audioRef.current.onended = () => {
+                    URL.revokeObjectURL(audioUrl);
+                  };
+                } catch (error) {
+                  console.error("Error processing audio response:", error);
+                }
+              }
             } else if (data.type === "error") {
-              setStatus(`Error: ${data.message}`);
-              console.error("Azure OpenAI Error:", data.message);
-            } else if (data.type === "content_block_notification") {
-              setStatus("Content blocked: Violated content policy");
-              console.warn("Content blocked:", data);
-            } else if (data.type === "audio_response") {
-              console.log("Received audio response:", data);
+              const errorMessage = data.message || data.error?.message || "An unknown error occurred";
+              setStatus(`Error: ${errorMessage}`);
+              console.error("Azure OpenAI Error:", data);
+              
+              // Display a more user-friendly error in the messages area
+              if (errorMessage.includes("content policy")) {
+                setMessages(prev => [...prev, { 
+                  role: "system", 
+                  content: "Sorry, that request couldn't be processed due to content policy restrictions."
+                }]);
+              } else {
+                setMessages(prev => [...prev, { 
+                  role: "system", 
+                  content: "Sorry, there was an issue processing your request. Please try again."
+                }]);
+              }
             } else {
               console.log("Other message type:", data.type);
             }
@@ -71,10 +124,11 @@ export default function Home() {
           setIsConnected(false);
           setStatus(`Disconnected (${event.code}: ${event.reason || 'Unknown reason'})`);
           
-          // Attempt to reconnect unless it was closed intentionally
+          // Attempt to reconnect after a delay, with exponential backoff
           if (event.code !== 1000) {
-            console.log("Attempting to reconnect in 5 seconds...");
-            setTimeout(connectWebSocketProxy, 5000);
+            const reconnectDelay = Math.min(5000 + Math.random() * 1000, 30000);
+            console.log(`Attempting to reconnect in ${reconnectDelay/1000} seconds...`);
+            setTimeout(connectWebSocketProxy, reconnectDelay);
           }
         };
         
@@ -87,6 +141,9 @@ export default function Home() {
       } catch (error) {
         console.error("Error in connectWebSocketProxy:", error);
         setStatus("Failed to establish connection");
+        
+        // Attempt to reconnect after error
+        setTimeout(connectWebSocketProxy, 5000);
       }
     };
     
@@ -206,8 +263,28 @@ export default function Home() {
     }
   };
 
+  // Helper function to convert base64 to Blob
+  const base64ToBlob = (base64: string, mimeType: string) => {
+    const byteCharacters = atob(base64);
+    const byteArrays = [];
+
+    for (let i = 0; i < byteCharacters.length; i += 512) {
+      const slice = byteCharacters.slice(i, i + 512);
+      const byteNumbers = new Array(slice.length);
+      
+      for (let j = 0; j < slice.length; j++) {
+        byteNumbers[j] = slice.charCodeAt(j);
+      }
+      
+      const byteArray = new Uint8Array(byteNumbers);
+      byteArrays.push(byteArray);
+    }
+
+    return new Blob(byteArrays, { type: mimeType });
+  };
+
   return (
-    <div className="grid grid-rows-[auto_1fr_auto] items-center min-h-screen p-8 pb-20 gap-8 font-[family-name:var(--font-geist-sans)]">
+    <div className="grid grid-rows-[auto_1fr_auto] items-center min-h-screen p-8 pb-20 gap-8 font-sans">
       <header className="w-full text-center">
         <h1 className="text-3xl font-bold mb-2">Azure OpenAI Voice Chat</h1>
         <p className="text-gray-600 dark:text-gray-300">
@@ -263,7 +340,7 @@ export default function Home() {
       </main>
       
       <footer className="text-center text-sm text-gray-500 dark:text-gray-400">
-        Powered by Azure OpenAI Real-time API
+        Powered by Azure OpenAI Real-time API with Voice
       </footer>
     </div>
   );
