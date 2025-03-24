@@ -8,72 +8,28 @@ export default function Home() {
   const [isRecording, setIsRecording] = useState(false);
   const [messages, setMessages] = useState<Array<{role: string, content: string}>>([]);
   const [status, setStatus] = useState("Ready");
-  const [authToken, setAuthToken] = useState<string | null>(null);
   
   const wsRef = useRef<WebSocket | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<BlobPart[]>([]);
   
-  // First fetch the auth token from our secure API
+  // Connect to our WebSocket proxy instead of directly to Azure
   useEffect(() => {
-    const fetchAuthToken = async () => {
+    const connectWebSocketProxy = () => {
       try {
-        setStatus("Fetching authentication...");
-        const response = await fetch('/api/azure-openai', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action: 'token' })
-        });
+        setStatus("Connecting to WebSocket proxy...");
         
-        if (!response.ok) {
-          throw new Error(`HTTP error: ${response.status}`);
-        }
-        
-        const data = await response.json();
-        setAuthToken(data.token);
-      } catch (error) {
-        console.error("Error fetching auth token:", error);
-        setStatus("Authentication failed");
-      }
-    };
-    
-    fetchAuthToken();
-  }, []);
-  
-  // Then connect to Azure OpenAI when we have the token
-  useEffect(() => {
-    if (!authToken) return;
-    
-    // Connect to Azure OpenAI real-time API
-    const connectAzureOpenAI = () => {
-      try {
-        setStatus("Connecting to Azure OpenAI...");
-        
-        const endpoint = process.env.NEXT_PUBLIC_AZURE_OPENAI_ENDPOINT;
-        const apiVersion = process.env.NEXT_PUBLIC_AZURE_OPENAI_API_VERSION;
-        const deployment = process.env.NEXT_PUBLIC_AZURE_OPENAI_DEPLOYMENT;
-        
-        if (!endpoint || !apiVersion || !deployment) {
-          setStatus("Missing configuration");
-          return;
-        }
-        
-        // Create WebSocket URL with the deployment name and API version
-        const wsUrl = `${endpoint}?api-version=${apiVersion}&deployment=${deployment}`;
-        console.log("Connecting to WebSocket:", wsUrl);
+        // Connect to our local WebSocket proxy
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/api/ws-proxy`;
+        console.log("Connecting to WebSocket proxy:", wsUrl);
         
         const ws = new WebSocket(wsUrl);
         
         ws.onopen = () => {
-          console.log("WebSocket connection opened");
-          setIsConnected(true);
-          setStatus("Connected to Azure OpenAI");
-          
-          // Send authentication message immediately after connection
-          ws.send(JSON.stringify({
-            type: "authentication",
-            apiKey: authToken
-          }));
+          console.log("WebSocket connection to proxy opened");
+          // Don't set connected here - wait for the status message from the proxy
+          setStatus("Connected to proxy, waiting for Azure...");
         };
         
         ws.onmessage = (event) => {
@@ -81,7 +37,15 @@ export default function Home() {
             console.log("Received message:", event.data);
             const data = JSON.parse(event.data);
             
-            if (data.type === "message") {
+            if (data.type === "status") {
+              if (data.status === "connected") {
+                setIsConnected(true);
+                setStatus("Connected to Azure OpenAI");
+              } else if (data.status === "disconnected") {
+                setIsConnected(false);
+                setStatus(`Disconnected (${data.code}: ${data.reason || 'Unknown reason'})`);
+              }
+            } else if (data.type === "message") {
               setMessages(prev => [...prev, { 
                 role: "assistant", 
                 content: data.content || "Sorry, I couldn't process that."
@@ -89,6 +53,13 @@ export default function Home() {
             } else if (data.type === "error") {
               setStatus(`Error: ${data.message}`);
               console.error("Azure OpenAI Error:", data.message);
+            } else if (data.type === "content_block_notification") {
+              setStatus("Content blocked: Violated content policy");
+              console.warn("Content blocked:", data);
+            } else if (data.type === "audio_response") {
+              console.log("Received audio response:", data);
+            } else {
+              console.log("Other message type:", data.type);
             }
           } catch (error) {
             console.error("Error parsing WebSocket message:", error);
@@ -96,30 +67,30 @@ export default function Home() {
         };
         
         ws.onclose = (event) => {
-          console.log("WebSocket closed with code:", event.code);
+          console.log("WebSocket closed with code:", event.code, "reason:", event.reason);
           setIsConnected(false);
           setStatus(`Disconnected (${event.code}: ${event.reason || 'Unknown reason'})`);
           
           // Attempt to reconnect unless it was closed intentionally
           if (event.code !== 1000) {
-            setTimeout(connectAzureOpenAI, 5000);
+            console.log("Attempting to reconnect in 5 seconds...");
+            setTimeout(connectWebSocketProxy, 5000);
           }
         };
         
         ws.onerror = (error) => {
-          // The error object doesn't have useful info in browsers due to security restrictions
           console.error("WebSocket error occurred");
           setStatus("Connection error - check console");
         };
         
         wsRef.current = ws;
       } catch (error) {
-        console.error("Error in connectAzureOpenAI:", error);
+        console.error("Error in connectWebSocketProxy:", error);
         setStatus("Failed to establish connection");
       }
     };
     
-    connectAzureOpenAI();
+    connectWebSocketProxy();
     
     return () => {
       if (wsRef.current) {
@@ -130,13 +101,13 @@ export default function Home() {
         }
       }
     };
-  }, [authToken]);
+  }, []);
   
   const startRecording = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       
-      // Try to use audio/webm; codec=opus first, fall back to audio/webm
+      // Azure OpenAI supports webm opus format for audio
       let options;
       try {
         options = { mimeType: 'audio/webm; codecs=opus' };
@@ -153,48 +124,42 @@ export default function Home() {
       mediaRecorder.ondataavailable = (event) => {
         if (event.data.size > 0) {
           audioChunksRef.current.push(event.data);
+          
+          // Send audio chunk directly to Azure OpenAI in real-time
+          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+            const reader = new FileReader();
+            reader.readAsDataURL(event.data);
+            reader.onloadend = () => {
+              const base64data = reader.result as string;
+              // Remove the content type prefix (e.g., "data:audio/webm;base64,")
+              const audioData = base64data.split(',')[1];
+              
+              wsRef.current?.send(JSON.stringify({
+                type: "audio",
+                data: audioData,
+                format: mediaRecorder.mimeType.includes('opus') 
+                  ? 'webm;codecs=opus' 
+                  : 'webm'
+              }));
+            };
+          }
         }
       };
       
       mediaRecorder.onstop = async () => {
         // Stop all tracks to release the microphone
         stream.getTracks().forEach(track => track.stop());
-        
-        const audioBlob = new Blob(audioChunksRef.current, { type: mediaRecorder.mimeType });
-        console.log(`Recorded audio (${audioBlob.size} bytes) with mime type: ${mediaRecorder.mimeType}`);
-        
-        // Send the audio to Azure OpenAI via WebSocket
-        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-          setStatus("Processing audio");
-          
-          // Convert blob to base64
-          const reader = new FileReader();
-          reader.readAsDataURL(audioBlob);
-          reader.onloadend = () => {
-            const base64data = reader.result as string;
-            // Remove the content type prefix (e.g., "data:audio/webm;base64,")
-            const audioData = base64data.split(',')[1];
-            
-            const format = mediaRecorder.mimeType.includes('opus') 
-              ? 'webm;codecs=opus' 
-              : 'webm';
-            
-            // Send the audio data to Azure OpenAI
-            wsRef.current?.send(JSON.stringify({
-              type: "audio",
-              data: audioData,
-              format: format
-            }));
-            
-            // Don't add user message here - we'll do it in stopRecording
-          };
-        }
+        console.log("Recording stopped");
       };
       
-      // Request data every 250ms to get smaller chunks
-      mediaRecorder.start(250);
+      // Request data in smaller chunks for real-time processing
+      mediaRecorder.start(100); // Send audio chunks every 100ms
       setIsRecording(true);
       setStatus("Recording");
+      
+      // Add user message to show recording started
+      setMessages(prev => [...prev, { role: "user", content: "🎤 Recording started..." }]);
+      
     } catch (error) {
       console.error("Error starting recording:", error);
       setStatus("Error accessing microphone");
@@ -205,9 +170,31 @@ export default function Home() {
     if (mediaRecorderRef.current) {
       mediaRecorderRef.current.stop();
       setIsRecording(false);
+      setStatus("Processing audio");
       
-      // Add user message to the conversation
-      setMessages(prev => [...prev, { role: "user", content: "🎤 Voice message sent" }]);
+      // Update the user message
+      setMessages(prev => {
+        const newMessages = [...prev];
+        // Find and update the last user message if it was about recording
+        const lastUserMsgIndex = newMessages.findIndex(
+          msg => msg.role === "user" && msg.content === "🎤 Recording started..."
+        );
+        
+        if (lastUserMsgIndex !== -1) {
+          newMessages[lastUserMsgIndex].content = "🎤 Voice message sent";
+        } else {
+          newMessages.push({ role: "user", content: "🎤 Voice message sent" });
+        }
+        
+        return newMessages;
+      });
+      
+      // Send end-of-audio signal to Azure OpenAI
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({
+          type: "end_of_audio"
+        }));
+      }
     }
   };
   

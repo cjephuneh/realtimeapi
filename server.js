@@ -2,7 +2,6 @@ const { createServer } = require('http');
 const { parse } = require('url');
 const next = require('next');
 const WebSocket = require('ws');
-const { v4: uuidv4 } = require('uuid');
 require('dotenv').config({ path: '.env.local' });
 
 const dev = process.env.NODE_ENV !== 'production';
@@ -11,11 +10,18 @@ const handle = app.getRequestHandler();
 
 const PORT = process.env.PORT || 3000;
 
+// Log environment variables without exposing full keys
+console.log('Environment check:');
+console.log('- AZURE_OPENAI_ENDPOINT:', process.env.AZURE_OPENAI_ENDPOINT ? '✓' : '✗');
+console.log('- AZURE_OPENAI_API_VERSION:', process.env.AZURE_OPENAI_API_VERSION ? '✓' : '✗');
+console.log('- AZURE_OPENAI_DEPLOYMENT:', process.env.AZURE_OPENAI_DEPLOYMENT ? '✓' : '✗');
+console.log('- AZURE_OPENAI_KEY:', process.env.AZURE_OPENAI_KEY ? '✓' : '✗');
+
 // Azure OpenAI endpoint details
-const azureEndpoint = process.env.NEXT_PUBLIC_AZURE_OPENAI_ENDPOINT;
-const azureApiVersion = process.env.NEXT_PUBLIC_AZURE_OPENAI_API_VERSION;
-const azureDeployment = process.env.NEXT_PUBLIC_AZURE_OPENAI_DEPLOYMENT;
-const azureApiKey = process.env.AZURE_OPENAI_API_KEY;
+const azureEndpoint = process.env.AZURE_OPENAI_ENDPOINT;
+const azureApiVersion = process.env.AZURE_OPENAI_API_VERSION;
+const azureDeployment = process.env.AZURE_OPENAI_DEPLOYMENT;
+const azureApiKey = process.env.AZURE_OPENAI_KEY;
 
 if (!azureEndpoint || !azureApiVersion || !azureDeployment || !azureApiKey) {
   console.error('Missing Azure OpenAI configuration');
@@ -24,103 +30,150 @@ if (!azureEndpoint || !azureApiVersion || !azureDeployment || !azureApiKey) {
 
 // Start the Next.js app
 app.prepare().then(() => {
+  console.log('Next.js app prepared');
+  
   // Create HTTP server
   const server = createServer((req, res) => {
     const parsedUrl = parse(req.url, true);
+    
+    // Special handling for WebSocket upgrade requests
+    if (req.url.startsWith('/api/ws-proxy')) {
+      console.log('Received request to WebSocket endpoint');
+    }
+    
     handle(req, res, parsedUrl);
   });
 
-  // Create WebSocket server
-  const wss = new WebSocket.Server({ server, path: '/api/ws-proxy' });
+  // Create WebSocket server - SIMPLER CONFIGURATION
+  const wss = new WebSocket.Server({ 
+    server,
+    path: '/api/ws-proxy'
+  });
   
-  // Track client connections
-  const clients = new Map();
-
-  wss.on('connection', (ws) => {
-    const clientId = uuidv4();
-    console.log(`Client connected: ${clientId}`);
+  // Handle WebSocket server errors
+  wss.on('error', (error) => {
+    console.error('WebSocket Server Error:', error.message);
+  });
+  
+  console.log('WebSocket server created on path: /api/ws-proxy');
+  
+  wss.on('connection', (ws, req) => {
+    console.log('Client connected to proxy');
     
-    // Set up Azure OpenAI WebSocket connection
-    const azureWsUrl = `${azureEndpoint}?api-version=${azureApiVersion}&deployment=${azureDeployment}`;
+    // Create WebSocket URL for Azure OpenAI
+    const cleanEndpoint = azureEndpoint.replace(/^https?:\/\//, '').replace(/\/$/, '');
+    const azureWsUrl = `wss://${cleanEndpoint}/openai/realtime?api-version=${azureApiVersion}&deployment=${azureDeployment}`;
     console.log(`Connecting to Azure OpenAI: ${azureWsUrl}`);
     
-    // Establish connection to Azure OpenAI
-    const azureWs = new WebSocket(azureWsUrl);
-    
-    // Store connection pair
-    clients.set(clientId, { clientWs: ws, azureWs });
+    // Connect to Azure OpenAI with proper headers
+    const azureWs = new WebSocket(azureWsUrl, {
+      headers: {
+        'api-key': azureApiKey
+      }
+    });
     
     // Handle Azure WebSocket events
     azureWs.on('open', () => {
-      console.log(`Azure connection opened for client ${clientId}`);
-      
-      // Send authentication message to Azure
-      azureWs.send(JSON.stringify({
-        type: "authentication",
-        apiKey: azureApiKey
-      }));
-      
-      // Notify client that connection is established
-      ws.send(JSON.stringify({
-        type: 'status',
-        status: 'connected'
-      }));
+      console.log('Connected to Azure OpenAI');
+      if (ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(JSON.stringify({
+            type: 'status',
+            status: 'connected'
+          }));
+          console.log('Sent connected status to client');
+        } catch (error) {
+          console.error('Error sending connected status:', error);
+        }
+      }
     });
     
     azureWs.on('message', (data) => {
-      console.log(`Received message from Azure`);
       // Forward message from Azure to client
-      ws.send(data.toString());
+      if (ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(data.toString());
+        } catch (error) {
+          console.error('Error forwarding message from Azure:', error);
+        }
+      }
     });
     
     azureWs.on('error', (error) => {
-      console.error(`Azure WebSocket error for client ${clientId}:`, error.message);
-      // Notify client of error
-      ws.send(JSON.stringify({
-        type: 'error',
-        message: 'Azure connection error'
-      }));
+      console.error('Azure WebSocket error:', error.message);
+      if (ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(JSON.stringify({
+            type: 'error',
+            message: 'Azure connection error: ' + error.message
+          }));
+        } catch (err) {
+          console.error('Error sending error message to client:', err);
+        }
+      }
     });
     
     azureWs.on('close', (code, reason) => {
-      console.log(`Azure connection closed for client ${clientId}: ${code} - ${reason}`);
-      // Notify client
-      ws.send(JSON.stringify({
-        type: 'status',
-        status: 'disconnected',
-        code,
-        reason
-      }));
+      console.log(`Azure connection closed: ${code} - ${reason}`);
+      if (ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(JSON.stringify({
+            type: 'status',
+            status: 'disconnected',
+            code,
+            reason: reason.toString()
+          }));
+          // Close client connection when Azure disconnects
+          ws.close(code, reason.toString());
+        } catch (error) {
+          console.error('Error closing client connection:', error);
+        }
+      }
     });
     
     // Handle client WebSocket events
     ws.on('message', (data) => {
-      // Forward client message to Azure
+      // Forward message from client to Azure
       if (azureWs.readyState === WebSocket.OPEN) {
-        console.log(`Forwarding message to Azure`);
-        azureWs.send(data.toString());
+        try {
+          azureWs.send(data.toString());
+        } catch (error) {
+          console.error('Error forwarding message to Azure:', error);
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: 'error',
+              message: 'Failed to send message to Azure'
+            }));
+          }
+        }
       } else {
-        console.error(`Azure WebSocket not ready for client ${clientId}`);
-        ws.send(JSON.stringify({
-          type: 'error',
-          message: 'Azure connection not ready'
-        }));
+        console.warn('Azure WebSocket not ready');
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            message: 'Azure connection not ready'
+          }));
+        }
       }
     });
     
-    ws.on('close', () => {
-      console.log(`Client disconnected: ${clientId}`);
+    ws.on('error', (error) => {
+      console.error('Client WebSocket error:', error.message);
+    });
+    
+    ws.on('close', (code, reason) => {
+      console.log(`Client disconnected: ${code} - ${reason || 'No reason'}`);
       // Close Azure connection when client disconnects
       if (azureWs.readyState === WebSocket.OPEN) {
-        azureWs.close();
+        azureWs.close(1000, 'Client disconnected');
       }
-      clients.delete(clientId);
     });
   });
 
   // Start the server
   server.listen(PORT, (err) => {
     if (err) throw err;
-    console.log(`> Ready on http://localhost:${PORT}`);
+    console.log(`> Server ready on http://localhost:${PORT}`);
+    console.log(`> WebSocket proxy available at ws://localhost:${PORT}/api/ws-proxy`);
   });
 });
